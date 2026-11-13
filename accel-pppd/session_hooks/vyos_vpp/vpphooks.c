@@ -9,6 +9,7 @@
 
 #include "triton.h"
 #include "events.h"
+#include "log.h"
 #include "ap_session_hooks.h"
 
 #include "ap_session.h"
@@ -20,6 +21,7 @@
 #include "vppiputils.h"
 #include "vpppolicer.h"
 #include "vpppoe.h"
+#include "vppstats.h"
 
 #include "vpphooks.h"
 
@@ -81,6 +83,7 @@ int vpphook_pppoe_create_vpp_session_interface(struct ap_session *ses)
 	}
 
 	vpphook_get_pd(ses)->vpp_sw_if_index = ifindex;
+	vppstats_session_created(ses);
 	vpppoe_dump_interface_name(ifindex, ses->ifname, AP_IFNAME_LEN);
 
 	if (ses->ipv4) {
@@ -96,6 +99,7 @@ int vpphook_pppoe_create_vpp_session_interface(struct ap_session *ses)
 
 int vpphook_pppoe_terminate(struct ap_session *ses, int hard)
 {
+	struct vpphook_private_data_t *pd = vpphook_get_pd(ses);
 	uint8_t *mac = NULL;
 	uint16_t sid;
 	int ret = 0;
@@ -108,9 +112,20 @@ int vpphook_pppoe_terminate(struct ap_session *ses, int hard)
 	ret = vpppolicer_remove_limiter(ses);
 	if (ret)
 		goto exit;
+
+	/* the last counters, as late as possible and while the interface still exists */
+	vppstats_session_freeze(ses);
+
 	ret = vpppoe_sync_del_pppoe_interface(mac, sid);
+	if (!ret && pd) {
+		/* the index is free for another session now, nothing may use it for this one */
+		pd->vpp_sw_if_index = 0;
+	}
 
 exit:
+	/* a failed step before the freeze: the interface is not deleted, so its last counters are the final ones */
+	if (ret)
+		vppstats_session_freeze(ses);
 	return ret;
 }
 
@@ -131,6 +146,11 @@ int vpphook_ipaddr_add_peer(struct ap_session *ses, int ifindex, in_addr_t addr,
 int vpphook_ipaddr_del(struct ap_session *ses, int ifindex, in_addr_t addr, int mask)
 {
 	uint32_t sw_ifindex = vpphook_get_pd(ses)->vpp_sw_if_index;
+
+	/* the interface is gone, so are its routes */
+	if (!sw_ifindex)
+		return 0;
+
 	/* remove route instead */
 	return vpp_iproute_add_del(ses, 0, sw_ifindex, 0, addr, 0, 0, mask, 0);
 }
@@ -138,6 +158,11 @@ int vpphook_ipaddr_del(struct ap_session *ses, int ifindex, in_addr_t addr, int 
 int vpphook_ipaddr_del_peer(struct ap_session *ses, int ifindex, in_addr_t addr, in_addr_t peer)
 {
 	uint32_t sw_ifindex = vpphook_get_pd(ses)->vpp_sw_if_index;
+
+	/* the interface is gone, so are its routes */
+	if (!sw_ifindex)
+		return 0;
+
 	/* remove route instead */
 	return vpp_iproute_add_del(ses, 0, sw_ifindex, 0, peer, 0, 0, 32, 0);
 }
@@ -151,6 +176,11 @@ int vpphook_iproute_add(struct ap_session *ses, int ifindex, in_addr_t src, in_a
 int vpphook_iproute_del(struct ap_session *ses, int ifindex, in_addr_t src, in_addr_t dst, in_addr_t gw, int proto, int mask, uint32_t prio, const char *vrf_name)
 {
 	uint32_t sw_ifindex = vpphook_get_pd(ses)->vpp_sw_if_index;
+
+	/* the interface is gone, so are its routes */
+	if (!sw_ifindex)
+		return 0;
+
 	return vpp_iproute_add_del(ses, 0, sw_ifindex, src, dst, gw, proto, mask, prio);
 }
 
@@ -163,6 +193,11 @@ int vpphook_ip6route_add(struct ap_session *ses, int ifindex, const struct in6_a
 int vpphook_ip6route_del(struct ap_session *ses, int ifindex, const struct in6_addr *dst, int pref_len, const struct in6_addr *gw, int proto, uint32_t prio, const char *vrf_name)
 {
 	uint32_t sw_ifindex = vpphook_get_pd(ses)->vpp_sw_if_index;
+
+	/* the interface is gone, so are its routes */
+	if (!sw_ifindex)
+		return 0;
+
 	return vpp_ip6route_add_del(ses, 0, sw_ifindex, dst, pref_len, gw, proto, prio);
 }
 
@@ -183,6 +218,11 @@ int vpphook_ip6addr_add_peer(struct ap_session *ses, int ifindex, struct in6_add
 int vpphook_ip6addr_del(struct ap_session *ses, int ifindex, struct in6_addr *addr, int prefix_len)
 {
 	uint32_t sw_ifindex = vpphook_get_pd(ses)->vpp_sw_if_index;
+
+	/* the interface is gone, so are its routes */
+	if (!sw_ifindex)
+		return 0;
+
 	/* remove route instead */
 	return vpp_ip6route_add_del(ses, 0, sw_ifindex, addr, prefix_len, NULL, 0, 0);
 }
@@ -213,6 +253,8 @@ struct ap_session_hooks_t vpp_hooks = {
 
 	.install_limiter = vpppolicer_install_limiter,
 	.remove_limiter = vpppolicer_remove_limiter,
+
+	.read_stats = vppstats_read_stats,
 
 	.is_non_dev_ppp = 1,
 	.is_non_socket_dhcpv6_nd = 1
